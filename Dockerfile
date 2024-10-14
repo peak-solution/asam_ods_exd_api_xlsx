@@ -1,4 +1,4 @@
-# docker build --tag docker.peak-solution.de/exd_api/np_mdf4 .
+# docker build --tag docker.peak-solution.de/exd_api/np_xlsx .
 FROM python:3.12-slim
 WORKDIR /app
 # Install required packages

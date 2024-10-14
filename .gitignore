@@ -1,4 +1,5 @@
 *.proto
+.coverage
 .venv/
 .vscode/
 __pycache__/

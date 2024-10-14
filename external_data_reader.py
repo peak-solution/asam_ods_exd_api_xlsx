@@ -1,14 +1,16 @@
 """
-ASAM ODS EXD API implementation for MDF 4 files
+ASAM ODS EXD API implementation for XLSX files
 """
 
 import os
 from pathlib import Path
 import threading
+from typing import Tuple
 from urllib.parse import urlparse, unquote
 from urllib.request import url2pathname
 
-from asammdf import MDF
+import pandas as pd
+import numpy as np
 import grpc
 
 # pylint: disable=E1101
@@ -19,12 +21,12 @@ import ods_external_data_pb2_grpc
 
 class ExternalDataReader(ods_external_data_pb2_grpc.ExternalDataReader):
     """
-    This class implements the ASAM ODS EXD API to read MDF4 files.
+    This class implements the ASAM ODS EXD API to read simple XLSX files.
     """
 
-    def Open(self, identifier: exd_api.Identifier, context: dict) -> exd_api.Handle:
+    def Open(self, identifier: exd_api.Identifier, context: grpc.ServicerContext) -> exd_api.Handle:
         """
-        Signals an open access to an resource. The server will call `close`later on.
+        Signals an open access to an resource. The server will call `close` later on.
 
         :param exd_api.Identifier identifier: Contains parameters and file url
         :param dict context: Additional parameters from grpc
@@ -33,14 +35,15 @@ class ExternalDataReader(ods_external_data_pb2_grpc.ExternalDataReader):
         """
         file_path = Path(self.__get_path(identifier.url))
         if not file_path.is_file():
-            raise ValueError(f'File "{identifier.url}" not accessible from plugin.')
+            raise ValueError(
+                f'File "{identifier.url}" not accessible from plugin.')
 
-        connection_id = self.__open_mdf(identifier)
+        connection_id = self.__open_with_identifier(identifier)
 
         rv = exd_api.Handle(uuid=connection_id)
         return rv
 
-    def Close(self, handle: exd_api.Handle, context: dict) -> exd_api.Empty:
+    def Close(self, handle: exd_api.Handle, context: grpc.ServicerContext) -> exd_api.Empty:
         """
         Close resource opened before and signal the plugin that it is no longer used.
 
@@ -48,10 +51,122 @@ class ExternalDataReader(ods_external_data_pb2_grpc.ExternalDataReader):
         :param dict context: Additional parameters from grpc.
         :return exd_api.Empty: Empty object.
         """
-        self.__close_mdf(handle)
+        self.__close_by_handle(handle)
         return exd_api.Empty()
 
-    def GetStructure(self, structure_request: exd_api.StructureRequest, context: dict) -> exd_api.StructureResult:
+    def __find_stable_datatype_row(self, df):
+        previous_dtypes = None
+        for index, row in df.iterrows():
+            current_dtypes = row.apply(type)
+            if row.isnull().all():
+                previous_dtypes = None
+                continue
+
+            # Replace integer based dtypes with float based
+            current_dtypes = current_dtypes.apply(
+                lambda dtype: np.float64 if np.issubdtype(dtype, np.integer) or np.issubdtype(dtype, np.floating) else dtype)
+
+            # Check if current row datatypes match the previous row datatypes
+            if previous_dtypes is None or not current_dtypes.equals(previous_dtypes):
+                previous_dtypes = current_dtypes
+            else:
+                # Check if at least one column isn't a string
+                if any(dtype != str for dtype in current_dtypes):
+                    return index - 1  # Return the index of the previous row
+
+        return None  # If no consistent row is found
+
+    def __calculate_mean_of_string_lengths(self, meta_rows):
+        mean_lengths = {}
+        for index, row in meta_rows.iterrows():
+            mean_lengths[index] = None
+            if row.apply(lambda x: isinstance(x, str) or pd.isnull(x)).all():
+                string_values = row.apply(
+                    lambda x: x if isinstance(x, str) else None).dropna()
+                if not string_values.empty:
+                    mean_length = string_values.apply(len).mean()
+                    mean_lengths[index] = mean_length
+
+        return mean_lengths
+
+    def __get_channel_data_type(self, channel) -> ods.DataTypeEnum:
+        if np.issubdtype(channel.dtypes, np.bool_):
+            return ods.DataTypeEnum.DT_BOOLEAN
+        if np.issubdtype(channel.dtypes, np.int8):
+            return ods.DataTypeEnum.DT_BYTE
+        if np.issubdtype(channel.dtypes, np.int16):
+            return ods.DataTypeEnum.DT_SHORT
+        if np.issubdtype(channel.dtypes, np.int32):
+            return ods.DataTypeEnum.DT_LONG
+        if np.issubdtype(channel.dtypes, np.int64):
+            # DT_LONGLONG # All int types are mapped to int64, so we pick double
+            return ods.DataTypeEnum.DT_DOUBLE
+        if np.issubdtype(channel.dtypes, np.float32):
+            return ods.DataTypeEnum.DT_FLOAT
+        if np.issubdtype(channel.dtypes, np.float64):
+            return ods.DataTypeEnum.DT_DOUBLE
+        if np.issubdtype(channel.dtypes, np.complex64):
+            return ods.DataTypeEnum.DT_COMPLEX
+        if np.issubdtype(channel.dtypes, np.complex128):
+            return ods.DataTypeEnum.DT_DCOMPLEX
+        if np.issubdtype(channel.dtypes, np.datetime64):
+            return ods.DataTypeEnum.DT_DATE
+        if channel.dtypes == np.object_ and isinstance(channel.iloc[0], str):
+            return ods.DataTypeEnum.DT_STRING
+        if channel.dtypes == np.object_ and isinstance(channel.iloc[0], int):
+            return ods.DataTypeEnum.DT_LONGLONG
+
+        raise NotImplementedError(f"Unknown pandas dtype {
+            channel.dtypes} for channel {channel.name}")
+
+    def __assign_df_values_to_unknown_sequence(self, section: pd.Series, channel_datatype: ods.DataTypeEnum,
+                                               new_channel_values: exd_api.ValuesResult.ChannelValues):
+        new_channel_values.values.data_type = channel_datatype
+        if channel_datatype == ods.DataTypeEnum.DT_BOOLEAN:
+            new_channel_values.values.boolean_array.values.extend(section)
+        elif channel_datatype == ods.DataTypeEnum.DT_BYTE:
+            new_channel_values.values.byte_array.values = section.tobytes()
+        elif channel_datatype == ods.DataTypeEnum.DT_SHORT:
+            new_channel_values.values.long_array.values[:] = section
+        elif channel_datatype == ods.DataTypeEnum.DT_LONG:
+            new_channel_values.values.long_array.values[:] = section
+        elif channel_datatype == ods.DataTypeEnum.DT_LONGLONG:
+            new_channel_values.values.longlong_array.values[:] = pd.to_numeric(
+                section, errors='coerce').fillna(0).astype(np.int64)
+        elif channel_datatype == ods.DataTypeEnum.DT_FLOAT:
+            new_channel_values.values.float_array.values[:] = section
+        elif channel_datatype == ods.DataTypeEnum.DT_DOUBLE:
+            new_channel_values.values.double_array.values[:] = pd.to_numeric(
+                section, errors='coerce').astype(np.float64)
+        elif channel_datatype == ods.DataTypeEnum.DT_DATE:
+            new_channel_values.values.string_array.values[:] = section.dt.strftime(
+                '%Y%m%d%H%M%S%f')
+        elif channel_datatype == ods.DataTypeEnum.DT_COMPLEX:
+            real_values = []
+            for complex_value in section:
+                real_values.append(complex_value.real)
+                real_values.append(complex_value.imag)
+            new_channel_values.values.float_array.values[:] = real_values
+        elif channel_datatype == ods.DataTypeEnum.DT_DCOMPLEX:
+            real_values = []
+            for complex_value in section:
+                real_values.append(complex_value.real)
+                real_values.append(complex_value.imag)
+            new_channel_values.values.double_array.values[:] = real_values
+        elif channel_datatype == ods.DataTypeEnum.DT_STRING:
+            new_channel_values.values.string_array.values[:] = section.fillna(
+                "").astype(dtype="str")
+        elif channel_datatype == ods.DataTypeEnum.DT_BYTESTR:
+            for item in section:
+                new_channel_values.values.bytestr_array.values.append(
+                    item.tobytes())
+        else:
+            raise NotImplementedError(
+                f"Unknown np datatype {
+                    section.dtype} for type {channel_datatype}!"
+            )
+
+    def GetStructure(self, structure_request: exd_api.StructureRequest, context: grpc.ServicerContext) -> exd_api.StructureResult:
         """
         Get the structure of the file returned as file-group-channel hierarchy.
 
@@ -70,38 +185,80 @@ class ExternalDataReader(ods_external_data_pb2_grpc.ExternalDataReader):
             raise NotImplementedError("Method not implemented!")
 
         identifier = self.connection_map[structure_request.handle.uuid]
-        mdf4 = self.__get_mdf(structure_request.handle)
+        xlsx = self.__get_by_handle(structure_request.handle)
 
         rv = exd_api.StructureResult(identifier=identifier)
         rv.name = Path(identifier.url).name
-        rv.attributes.variables["start_time"].string_array.values.append(mdf4.start_time.strftime("%Y%m%d%H%M%S%f"))
+        # rv.attributes.variables["start_time"].string_array.values.append(
+        #     xlsx.start_time.strftime("%Y%m%d%H%M%S%f"))
 
-        for group_index, group in enumerate(mdf4.groups):
+        for sheet_index, sheet_name in enumerate(xlsx.sheet_names, start=0):
+
+            meta_df, data_df = self.__load_sheet(context, xlsx, sheet_index)
+
+            column_descriptions = None
+            column_units = None
+            mean_of_string_length = self.__calculate_mean_of_string_lengths(
+                meta_df)
+            if len(mean_of_string_length) > 0:
+                for index, row in meta_df.iterrows():
+                    if mean_of_string_length[index] is not None:
+                        if mean_of_string_length[index] < 5:
+                            column_units = row
+                        else:
+                            column_descriptions = row
 
             new_group = exd_api.StructureResult.Group()
-            new_group.name = group.channel_group.acq_name
-            new_group.id = group_index
-            new_group.total_number_of_channels = len(group.channels)
-            new_group.number_of_rows = group.channel_group.cycles_nr
-            new_group.attributes.variables["description"].string_array.values.append(group.channel_group.comment)
+            new_group.name = sheet_name
+            new_group.id = sheet_index
+            new_group.total_number_of_channels = len(data_df.columns)
+            new_group.number_of_rows = int(data_df.shape[0])
 
-            for channel_index, channel in enumerate(group.channels):
+            for column_index, column in enumerate(data_df.columns, start=0):
                 new_channel = exd_api.StructureResult.Channel()
-                new_channel.name = channel.name
-                new_channel.id = channel_index
-                new_channel.data_type = self.__get_channel_data_type(channel)
-                new_channel.unit_string = channel.unit
-                if channel.comment is not None and "" != channel.comment:
-                    new_channel.attributes.variables["description"].string_array.values.append(channel.comment)
-                if 0 == channel_index:
-                    new_channel.attributes.variables["independent"].long_array.values.append(1)
+                new_channel.name = column
+                new_channel.id = column_index
+                column_unit = column_units.iloc[column_index] if column_units is not None else None
+                column_description = column_descriptions.iloc[
+                    column_index] if column_descriptions is not None else None
+
+                new_channel.data_type = self.__get_channel_data_type(
+                    data_df[column])
+                if column_unit is not None and not pd.isna(column_unit):
+                    new_channel.unit_string = column_unit
+                if column_description is not None and not pd.isna(column_description):
+                    new_channel.attributes.variables["description"].string_array.values.append(
+                        column_description)
+                if 0 == column_index and data_df.iloc[:, column_index].is_monotonic_increasing:
+                    new_channel.attributes.variables["independent"].long_array.values.append(
+                        1)
                 new_group.channels.append(new_channel)
 
             rv.groups.append(new_group)
 
         return rv
 
-    def GetValues(self, values_request: exd_api.ValuesRequest, context: dict) -> exd_api.ValuesResult:
+    def __load_sheet(self, context, xlsx: pd.ExcelFile, sheet_index: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        sheet_df = pd.read_excel(xlsx, sheet_name=sheet_index)
+        first_stable_row = self.__find_stable_datatype_row(sheet_df)
+        if first_stable_row is None:
+            context.set_details(
+                f"No stable row found in sheet {xlsx.sheet_names[sheet_index]}!")
+            context.abort_with_status(status=grpc.StatusCode.OUT_OF_RANGE)
+
+        meta_df = pd.DataFrame(
+            columns=sheet_df.columns) if first_stable_row == 0 else sheet_df.iloc[:first_stable_row].copy()
+
+        data_df = None
+        if 0 == first_stable_row:
+            data_df = sheet_df
+        else:
+            data_df = sheet_df.drop(range(first_stable_row))
+            data_df.reset_index(drop=True, inplace=True)
+            data_df = data_df.infer_objects()
+        return meta_df, data_df
+
+    def GetValues(self, values_request: exd_api.ValuesRequest, context: grpc.ServicerContext) -> exd_api.ValuesResult:
         """
         Retrieve channel/signal data identified by `values_request`.
 
@@ -110,102 +267,47 @@ class ExternalDataReader(ods_external_data_pb2_grpc.ExternalDataReader):
         :raises NotImplementedError: If unknown data type is accessed.
         :return exd_api.ValuesResult: The chunk of bulk data.
         """
-        mdf4 = self.__get_mdf(values_request.handle)
+        xlsx = self.__get_by_handle(values_request.handle)
 
-        if values_request.group_id < 0 or values_request.group_id >= len(mdf4.groups):
-            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+        if values_request.group_id < 0 or values_request.group_id >= len(xlsx.sheet_names):
             context.set_details(f"Invalid group id {values_request.group_id}!")
-            raise NotImplementedError(f"Invalid group id {values_request.group_id}!")
+            context.abort_with_status(status=grpc.StatusCode.OUT_OF_RANGE)
 
-        group = mdf4.groups[values_request.group_id]
+        _, bulk_df = self.__load_sheet(
+            context, xlsx, values_request.group_id)
 
-        nr_of_rows = group.channel_group.cycles_nr
+        nr_of_rows = bulk_df.shape[0]
         if values_request.start > nr_of_rows:
             context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-            context.set_details(f"Channel start index {values_request.start} out of range!")
-            raise NotImplementedError(f"Channel start index {values_request.start} out of range!")
+            context.set_details(f"Channel start index {
+                                values_request.start} out of range!")
+            raise NotImplementedError(f"Channel start index {
+                                      values_request.start} out of range!")
 
-        end_index = values_request.start + values_request.limit
-        if end_index >= nr_of_rows:
-            end_index = nr_of_rows
-
-        channels_to_load = []
-        for channel_id in values_request.channel_ids:
-            if channel_id >= len(group.channels):
-                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-                context.set_details(f"Invalid channel id {channel_id}!")
-                raise NotImplementedError(f"Invalid channel id {channel_id}!")
-            channels_to_load.append((None, values_request.group_id, channel_id))
-
-        data = mdf4.select(
-            channels_to_load,
-            raw=False,
-            ignore_value2text_conversions=False,
-            record_offset=values_request.start,
-            record_count=values_request.limit,
-            copy_master=False,
-        )
-        if len(data) != len(values_request.channel_ids):
-            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-            context.set_details(
-                f"Number read {len(data)} does not match requested channel count {len(values_request.channel_ids)} in {mdf4.name.name}!"
-            )
-            raise NotImplementedError(
-                f"Number read {len(data)} does not match requested channel count {len(values_request.channel_ids)} in {mdf4.name.name}!"
-            )
+        end_index = min(values_request.start +
+                        values_request.limit, nr_of_rows)
 
         rv = exd_api.ValuesResult(id=values_request.group_id)
-        for signal_index, signal in enumerate(data, start=0):
-            section = signal.samples
-            channel_id = values_request.channel_ids[signal_index]
-            channel = group.channels[channel_id]
-            channel_datatype = self.__get_channel_data_type(channel)
+        for channel_id in values_request.channel_ids:
+            if channel_id >= bulk_df.shape[1]:
+                context.set_details(f"Invalid channel id {channel_id}!")
+                context.abort_with_status(status=grpc.StatusCode.OUT_OF_RANGE)
+
+            section = bulk_df.iloc[values_request.start: end_index, channel_id]
+
+            channel_datatype = self.__get_channel_data_type(section)
 
             new_channel_values = exd_api.ValuesResult.ChannelValues()
             new_channel_values.id = channel_id
-            new_channel_values.values.data_type = channel_datatype
 
-            if channel_datatype == ods.DataTypeEnum.DT_BOOLEAN:
-                new_channel_values.values.boolean_array.values.extend(section)
-            elif channel_datatype == ods.DataTypeEnum.DT_BYTE:
-                new_channel_values.values.byte_array.values = section.tobytes()
-            elif channel_datatype == ods.DataTypeEnum.DT_SHORT:
-                new_channel_values.values.long_array.values[:] = section
-            elif channel_datatype == ods.DataTypeEnum.DT_LONG:
-                new_channel_values.values.long_array.values[:] = section
-            elif channel_datatype == ods.DataTypeEnum.DT_LONGLONG:
-                new_channel_values.values.longlong_array.values[:] = section
-            elif channel_datatype == ods.DataTypeEnum.DT_FLOAT:
-                new_channel_values.values.float_array.values[:] = section
-            elif channel_datatype == ods.DataTypeEnum.DT_DOUBLE:
-                new_channel_values.values.double_array.values[:] = section
-            elif channel_datatype == ods.DataTypeEnum.DT_COMPLEX:
-                real_values = []
-                for complex_value in section:
-                    real_values.append(complex_value.real)
-                    real_values.append(complex_value.imag)
-                new_channel_values.values.float_array.values[:] = real_values
-            elif channel_datatype == ods.DataTypeEnum.DT_DCOMPLEX:
-                real_values = []
-                for complex_value in section:
-                    real_values.append(complex_value.real)
-                    real_values.append(complex_value.imag)
-                new_channel_values.values.double_array.values[:] = real_values
-            elif channel_datatype == ods.DataTypeEnum.DT_STRING:
-                new_channel_values.values.string_array.values[:] = section
-            elif channel_datatype == ods.DataTypeEnum.DT_BYTESTR:
-                for item in section:
-                    new_channel_values.values.bytestr_array.values.append(item.tobytes())
-            else:
-                raise NotImplementedError(
-                    f"Unknown np datatype {section.dtype} for type {channel_datatype} in {mdf4.name.name}!"
-                )
+            self.__assign_df_values_to_unknown_sequence(
+                section, channel_datatype, new_channel_values)
 
             rv.channels.append(new_channel_values)
 
         return rv
 
-    def GetValuesEx(self, request: exd_api.ValuesExRequest, context: dict) -> exd_api.ValuesExResult:
+    def GetValuesEx(self, request: exd_api.ValuesExRequest, context: grpc.ServicerContext) -> exd_api.ValuesExResult:
         """
         Method to access virtual groups and channels. Currently not supported by the plugin
 
@@ -218,138 +320,53 @@ class ExternalDataReader(ods_external_data_pb2_grpc.ExternalDataReader):
         context.set_details("Method not implemented!")
         raise NotImplementedError("Method not implemented!")
 
-    def __get_channel_data_type(self, channel):
-        rv = self.__get_channel_data_type_base(channel)
-        if channel.conversion is not None:
-            if ods.DataTypeEnum.DT_STRING == rv:
-                if 9 == channel.conversion.conversion_type:
-                    # text to value tabular look-up
-                    return ods.DataTypeEnum.DT_DOUBLE
-            elif channel.conversion.conversion_type in [1, 2, 3, 4, 5]:
-                return ods.DataTypeEnum.DT_DOUBLE
-            elif channel.conversion.conversion_type in [7, 8]:
-                return ods.DataTypeEnum.DT_STRING
-        return rv
-
-    def __get_channel_data_type_base(self, channel):
-        # [width="100",options="header"]
-        # |====================
-        # | number | cn_bit_count | DataTypeEnum | description
-        # | _Integer data types:_ | | |
-        # | 0, 1   | 1           | DT_BOOLEAN  | unsigned integer (LE Byte order, BE Byte order)
-        # | 0, 1   | 2 - 8       | DT_BYTE     | unsigned integer (LE Byte order, BE Byte order)
-        # | 0, 1   | 8 - 15      | DT_SHORT    | unsigned integer (LE Byte order, BE Byte order)
-        # | 0, 1   | 16 - 31     | DT_LONG     | unsigned integer (LE Byte order, BE Byte order)
-        # | 0, 1   | 32 - 63     | DT_LONGLONG | unsigned integer (LE Byte order, BE Byte order)
-        # | 2, 3   | 64 - 64     | DT_DOUBLE   | signed integer (two’s complement) (LE Byte order, BE Byte order)
-        # | 2, 3   | 1           | DT_BOOLEAN  | signed integer (two’s complement) (LE Byte order, BE Byte order)
-        # | 2, 3   | 2 - 16      | DT_SHORT    | signed integer (two’s complement) (LE Byte order, BE Byte order)
-        # | 2, 3   | 17 - 32     | DT_LONG     | signed integer (two’s complement) (LE Byte order, BE Byte order)
-        # | 2, 3   | 33 - 64     | DT_LONGLONG | signed integer (two’s complement) (LE Byte order, BE Byte order)
-        # | _Floating-point data types:_ | | |
-        # | 4, 5   | 16, 32      | DT_FLOAT    | IEEE 754 floating-point format (LE Byte order, BE Byte order)
-        # | 4, 5   | 64          | DT_DOUBLE   | IEEE 754 floating-point format (LE Byte order, BE Byte order)
-        # | _String data types:_ | | |
-        # | 6      |             | DT_STRING   | string (SBC, standard ISO-8859-1 encoded (Latin), NULL terminated)
-        # | 7      |             | DT_STRING   | string (UTF-8 encoded, NULL terminated)
-        # | 8      |             | DT_STRING   | string (UTF-16 encoded LE Byte order, NULL terminated)
-        # | 9      |             | DT_STRING   | string (UTF-16 encoded BE Byte order, NULL terminated)
-        # | _Complex data types:_ | | |
-        # | 10     |             | DT_BYTESTR  | byte array with unknown content (e.g. structure)
-        # | 11     |             | DT_BYTESTR  | MIME sample (sample is Byte Array with MIME content-type specified in cn_md_unit)
-        # | 12     |             | DT_BYTESTR  | MIME stream (all samples of channel represent a stream with MIME content-type specified in cn_md_unit)
-        # | 13     |             | DT_DATE     | CANopen date (Based on 7 Byte CANopen Date data structure, see Table 39)
-        # | 14     |             | DT_DATE     | CANopen time (Based on 6 Byte CANopen Time data structure, see Table 40)
-        # | 15, 16 | 16, 32, 64  | DT_COMPLEX  | complex number (real part followed by imaginary part, stored as two floating-point data, both with 2, 4 or 8 Byte, LE Byte order, BE Byte order)
-        # | 15, 16 | 128         | DT_DCOMPLEX | complex number (real part followed by imaginary part, stored as two floating-point data, both with 2, 4 or 8 Byte, LE Byte order, BE Byte order)
-        # |====================
-        mdf4_data_type = channel.data_type
-        mdf4_data_bit_count = channel.bit_count
-        if 0 <= mdf4_data_type <= 1:
-            if 1 == mdf4_data_bit_count:
-                return ods.DataTypeEnum.DT_BOOLEAN
-            if 2 <= mdf4_data_bit_count <= 8:
-                return ods.DataTypeEnum.DT_BYTE
-            if 8 <= mdf4_data_bit_count <= 15:
-                return ods.DataTypeEnum.DT_SHORT
-            if 16 <= mdf4_data_bit_count <= 31:
-                return ods.DataTypeEnum.DT_LONG
-            if 32 <= mdf4_data_bit_count <= 63:
-                return ods.DataTypeEnum.DT_LONGLONG
-            if 64 <= mdf4_data_bit_count <= 64:
-                return ods.DataTypeEnum.DT_DOUBLE
-        if 2 <= mdf4_data_type <= 3:
-            if 1 == mdf4_data_bit_count:
-                return ods.DataTypeEnum.DT_BOOLEAN
-            if 2 <= mdf4_data_bit_count <= 16:
-                return ods.DataTypeEnum.DT_SHORT
-            if 17 <= mdf4_data_bit_count <= 32:
-                return ods.DataTypeEnum.DT_LONG
-            if 33 <= mdf4_data_bit_count <= 64:
-                return ods.DataTypeEnum.DT_LONGLONG
-        if 4 <= mdf4_data_type <= 5:
-            if 1 <= mdf4_data_bit_count <= 32:
-                return ods.DataTypeEnum.DT_FLOAT
-            if 33 <= mdf4_data_bit_count <= 64:
-                return ods.DataTypeEnum.DT_DOUBLE
-        if 6 <= mdf4_data_type <= 9:
-            return ods.DataTypeEnum.DT_STRING
-        if 10 <= mdf4_data_type <= 12:
-            return ods.DataTypeEnum.DT_BYTESTR
-        if 13 <= mdf4_data_type <= 14:
-            return ods.DataTypeEnum.DT_DATE
-        if 15 <= mdf4_data_type <= 16:
-            if 1 <= mdf4_data_bit_count <= 64:
-                return ods.DataTypeEnum.DT_COMPLEX
-            if 65 <= mdf4_data_bit_count <= 128:
-                return ods.DataTypeEnum.DT_DCOMPLEX
-
-        return ods.DataTypeEnum.DT_DOUBLE
-
     def __init__(self):
         self.connect_count = 0
         self.connection_map = {}
         self.file_map = {}
         self.lock = threading.Lock()
 
-    def __get_id(self, identifier):
+    def __get_id(self, identifier: exd_api.Identifier) -> str:
         self.connect_count = self.connect_count + 1
         rv = str(self.connect_count)
         self.connection_map[rv] = identifier
         return rv
 
-    def __uri_to_path(self, uri):
+    def __uri_to_path(self, uri: str) -> str:
         parsed = urlparse(uri)
         host = f"{os.path.sep}{os.path.sep}{parsed.netloc}{os.path.sep}"
         return os.path.normpath(os.path.join(host, url2pathname(unquote(parsed.path))))
 
-    def __get_path(self, file_url):
+    def __get_path(self, file_url: str) -> str:
         final_path = self.__uri_to_path(file_url)
         return final_path
 
-    def __open_mdf(self, identifier):
+    def __open_with_identifier(self, identifier: exd_api.Identifier):
         with self.lock:
-            identifier.parameters
+            identifier.parameters  # might be used in the future
             connection_id = self.__get_id(identifier)
             connection_url = self.__get_path(identifier.url)
             if connection_url not in self.file_map:
-                self.file_map[connection_url] = {"mdf4": MDF(connection_url), "ref_count": 0}
+                self.file_map[connection_url] = {
+                    "xlsx": pd.ExcelFile(connection_url),
+                    "ref_count": 0
+                }
             self.file_map[connection_url]["ref_count"] = self.file_map[connection_url]["ref_count"] + 1
             return connection_id
 
-    def __get_mdf(self, handle):
+    def __get_by_handle(self, handle: exd_api.Handle) -> pd.ExcelFile:
         identifier = self.connection_map[handle.uuid]
         connection_url = self.__get_path(identifier.url)
-        return self.file_map[connection_url]["mdf4"]
+        return self.file_map[connection_url]["xlsx"]
 
-    def __close_mdf(self, handle):
+    def __close_by_handle(self, handle: exd_api.Handle):
         with self.lock:
             identifier = self.connection_map[handle.uuid]
             connection_url = self.__get_path(identifier.url)
             if self.file_map[connection_url]["ref_count"] > 1:
                 self.file_map[connection_url]["ref_count"] = self.file_map[connection_url]["ref_count"] - 1
             else:
-                self.file_map[connection_url]["mdf4"].close()
+                self.file_map[connection_url]["xlsx"].close()
                 del self.file_map[connection_url]
 
 
@@ -360,17 +377,19 @@ if __name__ == "__main__":
     external_data_reader = ExternalDataReader()
 
     exd_api_handle = external_data_reader.Open(
-        exd_api.Identifier(url="file://C:/build/asammdf/data/pendulum_1686037830.mf4"), None
+        exd_api.Identifier(
+            url="file:///workspaces/asam_ods_exd_api_xlsx/data/example_data_with_unit_and_comment.xlsx"), None
     )
     exd_api_request = exd_api.StructureRequest(handle=exd_api_handle)
-    exd_api_structure = external_data_reader.GetStructure(exd_api_request, None)
+    exd_api_structure = external_data_reader.GetStructure(
+        exd_api_request, None)
     print(MessageToJson(exd_api_structure))
 
     print(
         MessageToJson(
             external_data_reader.GetValues(
                 exd_api.ValuesRequest(
-                    handle=exd_api_handle, group_id=0, channel_ids=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9], start=0, limit=10
+                    handle=exd_api_handle, group_id=0, channel_ids=[0, 1, 2, 3], start=0, limit=100
                 ),
                 None,
             )

@@ -1,0 +1,7 @@
+[MASTER]
+# Add your test directory to the ignore list
+ignore-patterns=test_*.py
+
+[MESSAGES CONTROL]
+# Disable the missing-docstring warning (C0114, C0115, C0116)
+disable=C0114, C0115, C0116
