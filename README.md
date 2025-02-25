@@ -28,7 +28,7 @@ This repository contains a [ASAM ODS EXD-API](https://www.asam.net/standards/det
 ## GRPC stub
 
 The repository contains the stubs generated from ASAM ODS protobuf files.
-The files that match `*_pb2*` are generated using the following command. To renew them you must put the 
+The files that match `*_pb2*` are generated using the following command. To renew them you must put the
 [proto files from the ODS standard](https://github.com/asam-ev/ASAM-ODS-Interfaces) into `proto_src` and rerun the command.
 
 ```
@@ -44,7 +44,7 @@ sequenceDiagram
 
 actor CLIENT as Client
 participant PDTT as 🛠️Importer
-participant PODS as 🗃️ASAM ODS server 
+participant PODS as 🗃️ASAM ODS server
 participant PLUGIN as 📊EXD-API plugin
 participant FILE as 🗂️File Storage
 
@@ -73,4 +73,31 @@ loop Runtime phase
   PLUGIN ->> PODS: Return values of channels
   PODS ->> CLIENT: Return values needed for plot
 end
+```
+
+## Docker
+
+### Docker Image Details
+
+The Docker image for this project is available at:
+
+`ghcr.io/peak-solution/asam-ods-exd-api-xlsx:latest`
+
+This image is automatically built and pushed via a GitHub Actions workflow. To pull and run the image:
+
+```
+docker pull ghcr.io/peak-solution/asam-ods-exd-api-xlsx:latest
+docker run -v /path/to/local/data:/data -p 50051:50051 ghcr.io/peak-solution/asam-ods-exd-api-xlsx:latest
+```
+
+### Using the Docker Container
+
+To build the Docker image locally:
+```
+docker build -t asam-ods-exd-api-xlsx .
+```
+
+To start the Docker container:
+```
+docker run -v /path/to/local/data:/data -p 50051:50051 asam-ods-exd-api-xlsx
 ```
