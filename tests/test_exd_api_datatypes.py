@@ -183,3 +183,43 @@ class TestDataTypes(unittest.TestCase):
                 values.channels[3].values.string_array.values, ["abc", "def", "ghi"])
         finally:
             service.Close(handle, None)
+
+    def test_datetime_time(self):
+        file_url = self._get_example_file_path(
+            "datetime_date.xlsx")
+
+        service = ExternalDataReader()
+        handle = service.Open(oed.Identifier(
+            url=file_url, parameters=""), None)
+        try:
+            structure = service.GetStructure(
+                oed.StructureRequest(handle=handle), None)
+            self.log.info(MessageToJson(structure))
+            print(MessageToJson(structure))
+
+            self.assertEqual(
+                structure.name, "datetime_date.xlsx")
+            self.assertEqual(len(structure.groups), 1)
+            self.assertEqual(structure.groups[0].number_of_rows, 4)
+            self.assertEqual(len(structure.groups[0].channels), 2)
+            self.assertEqual(
+                1, structure.groups[0].channels[0].attributes.variables["independent"].long_array.values[0])
+            self.assertEqual("", structure.groups[0].channels[0].unit_string)
+            self.assertEqual("", structure.groups[0].channels[1].unit_string)
+
+            values = service.GetValues(
+                oed.ValuesRequest(
+                    handle=handle, group_id=0, start=0, limit=1000, channel_ids=[0, 1]), None
+            )
+            self.assertSequenceEqual(
+                values.channels[0].values.double_array.values, [1.0, 2.0, 3.0, 4.0])
+            self.assertEqual(
+                values.channels[1].values.data_type, ods.DataTypeEnum.DT_DATE)
+            self.assertSequenceEqual(
+                values.channels[1].values.string_array.values, [
+                    "19700101003000000000",
+                    "19700101003009000000",
+                    "19700101003018150000",
+                    "19700101133122300000"])
+        finally:
+            service.Close(handle, None)

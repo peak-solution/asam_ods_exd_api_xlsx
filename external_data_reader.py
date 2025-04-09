@@ -2,6 +2,7 @@
 ASAM ODS EXD API implementation for XLSX files
 """
 
+import datetime
 import os
 from pathlib import Path
 import threading
@@ -111,10 +112,14 @@ class ExternalDataReader(ods_external_data_pb2_grpc.ExternalDataReader):
             return ods.DataTypeEnum.DT_DCOMPLEX
         if np.issubdtype(channel.dtypes, np.datetime64):
             return ods.DataTypeEnum.DT_DATE
-        if channel.dtypes == np.object_ and isinstance(channel.iloc[0], str):
-            return ods.DataTypeEnum.DT_STRING
-        if channel.dtypes == np.object_ and isinstance(channel.iloc[0], int):
-            return ods.DataTypeEnum.DT_LONGLONG
+        if channel.dtypes == np.object_:
+            first_value = channel.iloc[0]
+            if isinstance(first_value, datetime.time):
+                return ods.DataTypeEnum.DT_DATE
+            if isinstance(first_value, str):
+                return ods.DataTypeEnum.DT_STRING
+            if isinstance(first_value, int):
+                return ods.DataTypeEnum.DT_LONGLONG
 
         raise NotImplementedError(f"Unknown pandas dtype {
             channel.dtypes} for channel {channel.name}")
@@ -139,8 +144,16 @@ class ExternalDataReader(ods_external_data_pb2_grpc.ExternalDataReader):
             new_channel_values.values.double_array.values[:] = pd.to_numeric(
                 section, errors='coerce').astype(np.float64)
         elif channel_datatype == ods.DataTypeEnum.DT_DATE:
-            new_channel_values.values.string_array.values[:] = section.dt.strftime(
-                '%Y%m%d%H%M%S%f')
+            if isinstance(section.iloc[0], datetime.time):
+                values = [
+                    datetime.datetime.combine(datetime.date(1970, 1, 1), t).strftime('%Y%m%d%H%M%S%f')
+                    if pd.notnull(t) else ""
+                    for t in section
+                ]
+                new_channel_values.values.string_array.values[:] = values
+            else:
+                new_channel_values.values.string_array.values[:] = section.dt.strftime(
+                    '%Y%m%d%H%M%S%f')
         elif channel_datatype == ods.DataTypeEnum.DT_COMPLEX:
             real_values = []
             for complex_value in section:
@@ -378,18 +391,31 @@ if __name__ == "__main__":
 
     exd_api_handle = external_data_reader.Open(
         exd_api.Identifier(
-            url="file:///workspaces/asam_ods_exd_api_xlsx/data/example_data_with_unit_and_comment.xlsx"), None
+            # url="file:///workspaces/asam_ods_exd_api_xlsx/data/example_data_with_unit_and_comment.xlsx"), None
+            url="file:///workspaces/asam_ods_exd_api_xlsx/data/datetime_date.xlsx"), None
     )
     exd_api_request = exd_api.StructureRequest(handle=exd_api_handle)
     exd_api_structure = external_data_reader.GetStructure(
         exd_api_request, None)
     print(MessageToJson(exd_api_structure))
 
+    # loop over all channels and read values
+    for group in exd_api_structure.groups:
+        channel_ids = [channel.id for channel in group.channels]
+        if len(channel_ids) > 0:
+            exd_api_values = external_data_reader.GetValues(
+                exd_api.ValuesRequest(
+                    handle=exd_api_handle,
+                    group_id=group.id,
+                    channel_ids=channel_ids,
+                    start=0,
+                    limit=group.number_of_rows), None)
+
     print(
         MessageToJson(
             external_data_reader.GetValues(
                 exd_api.ValuesRequest(
-                    handle=exd_api_handle, group_id=0, channel_ids=[0, 1, 2, 3], start=0, limit=100
+                    handle=exd_api_handle, group_id=0, channel_ids=[0, 1], start=0, limit=100
                 ),
                 None,
             )
