@@ -23,29 +23,32 @@ import ods_pb2 as ods
 
 
 class FileCache:
-    __xlsx: pd.ExcelFile
-    __sheet_cache: dict[int, Tuple[pd.DataFrame, pd.DataFrame]] = {}
 
     def __init__(self, connection_url: str):
+        self.__lock = threading.Lock()
         self.__xlsx = pd.ExcelFile(connection_url)
+        self.__sheet_cache: dict[int, Tuple[pd.DataFrame, pd.DataFrame]] = {}
 
     def xlsx(self) -> pd.ExcelFile:
         return self.__xlsx
 
     def close(self):
-        if self.__xlsx is not None:
-            self.__xlsx.close()
-            self.__xlsx = None
-        self.__sheet_cache.clear()
+        with self.__lock:
+            if self.__xlsx is not None:
+                logging.info("Close file")
+                self.__xlsx.close()
+                self.__xlsx = None
+            self.__sheet_cache.clear()
 
     def load_sheet(self, context, sheet_index: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        if sheet_index in self.__sheet_cache:
-            return self.__sheet_cache[sheet_index]
+        with self.__lock:
+            if sheet_index in self.__sheet_cache:
+                return self.__sheet_cache[sheet_index]
 
-        logging.info("Loading sheet with index %s", sheet_index)
-        meta_df, data_df = self.__load_sheet(context, sheet_index)
-        self.__sheet_cache[sheet_index] = (meta_df, data_df)
-        return meta_df, data_df
+            logging.info("Loading sheet with index %s", sheet_index)
+            meta_df, data_df = self.__load_sheet(context, sheet_index)
+            self.__sheet_cache[sheet_index] = (meta_df, data_df)
+            return meta_df, data_df
 
     def __load_sheet(self, context, sheet_index: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
         logging.info("Reading %s", sheet_index)
