@@ -21,7 +21,13 @@ def serve():
     By default the server will use https.
     """
     logging.info("Starting server")
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=10),
+        options=[
+            ("grpc.max_send_message_length", 256 * 1024 * 1024),
+            ("grpc.max_receive_message_length", 16 * 1024 * 1024),
+        ],
+    )
     ods_external_data_pb2_grpc.add_ExternalDataReaderServicer_to_server(ExternalDataReader(), server)
     server.add_insecure_port("[::]:50051")
     server.start()
