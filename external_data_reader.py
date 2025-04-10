@@ -3,21 +3,102 @@ ASAM ODS EXD API implementation for XLSX files
 """
 
 import datetime
+import logging
 import os
-from pathlib import Path
 import threading
+from pathlib import Path
 from typing import Tuple
-from urllib.parse import urlparse, unquote
+from urllib.parse import unquote, urlparse
 from urllib.request import url2pathname
 
-import pandas as pd
-import numpy as np
 import grpc
+import numpy as np
+import pandas as pd
+
+import ods_external_data_pb2 as exd_api
+import ods_external_data_pb2_grpc
 
 # pylint: disable=E1101
 import ods_pb2 as ods
-import ods_external_data_pb2 as exd_api
-import ods_external_data_pb2_grpc
+
+
+class FileCache:
+    __xlsx: pd.ExcelFile
+    __sheet_cache: dict[int, Tuple[pd.DataFrame, pd.DataFrame]] = {}
+
+    def __init__(self, connection_url: str):
+        self.__xlsx = pd.ExcelFile(connection_url)
+
+    def xlsx(self) -> pd.ExcelFile:
+        return self.__xlsx
+
+    def close(self):
+        if self.__xlsx is not None:
+            self.__xlsx.close()
+            self.__xlsx = None
+        self.__sheet_cache.clear()
+
+    def load_sheet(self, context, sheet_index: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        if sheet_index in self.__sheet_cache:
+            return self.__sheet_cache[sheet_index]
+
+        logging.info("Loading sheet with index %s", sheet_index)
+        meta_df, data_df = self.__load_sheet(context, sheet_index)
+        self.__sheet_cache[sheet_index] = (meta_df, data_df)
+        return meta_df, data_df
+
+    def __load_sheet(self, context, sheet_index: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        logging.info("Reading %s", sheet_index)
+        sheet_df = pd.read_excel(self.__xlsx, sheet_name=sheet_index)
+        logging.info("Read %s. Determine start.", sheet_index)
+        first_stable_row = self.__find_stable_datatype_row(sheet_df)
+        if first_stable_row is None:
+            context.set_details(f"No stable row found in sheet {self.__xlsx.sheet_names[sheet_index]}!")
+            context.abort_with_status(status=grpc.StatusCode.OUT_OF_RANGE)
+
+        logging.info("Meta from %s", sheet_index)
+        meta_df = (
+            pd.DataFrame(columns=sheet_df.columns)
+            if first_stable_row == 0
+            else sheet_df.iloc[:first_stable_row].copy()
+        )
+
+        logging.info("Data from %s", sheet_index)
+        data_df = None
+        if 0 == first_stable_row:
+            data_df = sheet_df
+        else:
+            data_df = sheet_df.drop(range(first_stable_row))
+            data_df.reset_index(drop=True, inplace=True)
+            data_df = data_df.infer_objects()
+
+        logging.info("Optimized %s", sheet_index)
+        return meta_df, data_df
+
+    def __find_stable_datatype_row(self, df):
+        previous_dtypes = None
+        for index, row in df.iterrows():
+            current_dtypes = row.apply(type)
+            if row.isnull().all():
+                previous_dtypes = None
+                continue
+
+            # Replace integer based dtypes with float based
+            current_dtypes = current_dtypes.apply(
+                lambda dtype: (
+                    np.float64 if np.issubdtype(dtype, np.integer) or np.issubdtype(dtype, np.floating) else dtype
+                )
+            )
+
+            # Check if current row datatypes match the previous row datatypes
+            if previous_dtypes is None or not current_dtypes.equals(previous_dtypes):
+                previous_dtypes = current_dtypes
+            else:
+                # Check if at least one column isn't a string
+                if any(dtype != str for dtype in current_dtypes):
+                    return index - 1  # Return the index of the previous row
+
+        return None  # If no consistent row is found
 
 
 class ExternalDataReader(ods_external_data_pb2_grpc.ExternalDataReader):
@@ -36,8 +117,7 @@ class ExternalDataReader(ods_external_data_pb2_grpc.ExternalDataReader):
         """
         file_path = Path(self.__get_path(identifier.url))
         if not file_path.is_file():
-            raise ValueError(
-                f'File "{identifier.url}" not accessible from plugin.')
+            raise ValueError(f'File "{identifier.url}" not accessible from plugin.')
 
         connection_id = self.__open_with_identifier(identifier)
 
@@ -55,35 +135,12 @@ class ExternalDataReader(ods_external_data_pb2_grpc.ExternalDataReader):
         self.__close_by_handle(handle)
         return exd_api.Empty()
 
-    def __find_stable_datatype_row(self, df):
-        previous_dtypes = None
-        for index, row in df.iterrows():
-            current_dtypes = row.apply(type)
-            if row.isnull().all():
-                previous_dtypes = None
-                continue
-
-            # Replace integer based dtypes with float based
-            current_dtypes = current_dtypes.apply(
-                lambda dtype: np.float64 if np.issubdtype(dtype, np.integer) or np.issubdtype(dtype, np.floating) else dtype)
-
-            # Check if current row datatypes match the previous row datatypes
-            if previous_dtypes is None or not current_dtypes.equals(previous_dtypes):
-                previous_dtypes = current_dtypes
-            else:
-                # Check if at least one column isn't a string
-                if any(dtype != str for dtype in current_dtypes):
-                    return index - 1  # Return the index of the previous row
-
-        return None  # If no consistent row is found
-
     def __calculate_mean_of_string_lengths(self, meta_rows):
         mean_lengths = {}
         for index, row in meta_rows.iterrows():
             mean_lengths[index] = None
             if row.apply(lambda x: isinstance(x, str) or pd.isnull(x)).all():
-                string_values = row.apply(
-                    lambda x: x if isinstance(x, str) else None).dropna()
+                string_values = row.apply(lambda x: x if isinstance(x, str) else None).dropna()
                 if not string_values.empty:
                     mean_length = string_values.apply(len).mean()
                     mean_lengths[index] = mean_length
@@ -121,11 +178,14 @@ class ExternalDataReader(ods_external_data_pb2_grpc.ExternalDataReader):
             if isinstance(first_value, int):
                 return ods.DataTypeEnum.DT_LONGLONG
 
-        raise NotImplementedError(f"Unknown pandas dtype {
-            channel.dtypes} for channel {channel.name}")
+        raise NotImplementedError(f"Unknown pandas dtype {channel.dtypes} for channel {channel.name}")
 
-    def __assign_df_values_to_unknown_sequence(self, section: pd.Series, channel_datatype: ods.DataTypeEnum,
-                                               new_channel_values: exd_api.ValuesResult.ChannelValues):
+    def __assign_df_values_to_unknown_sequence(
+        self,
+        section: pd.Series,
+        channel_datatype: ods.DataTypeEnum,
+        new_channel_values: exd_api.ValuesResult.ChannelValues,
+    ):
         new_channel_values.values.data_type = channel_datatype
         if channel_datatype == ods.DataTypeEnum.DT_BOOLEAN:
             new_channel_values.values.boolean_array.values.extend(section)
@@ -136,24 +196,28 @@ class ExternalDataReader(ods_external_data_pb2_grpc.ExternalDataReader):
         elif channel_datatype == ods.DataTypeEnum.DT_LONG:
             new_channel_values.values.long_array.values[:] = section
         elif channel_datatype == ods.DataTypeEnum.DT_LONGLONG:
-            new_channel_values.values.longlong_array.values[:] = pd.to_numeric(
-                section, errors='coerce').fillna(0).astype(np.int64)
+            new_channel_values.values.longlong_array.values[:] = (
+                pd.to_numeric(section, errors="coerce").fillna(0).astype(np.int64)
+            )
         elif channel_datatype == ods.DataTypeEnum.DT_FLOAT:
             new_channel_values.values.float_array.values[:] = section
         elif channel_datatype == ods.DataTypeEnum.DT_DOUBLE:
-            new_channel_values.values.double_array.values[:] = pd.to_numeric(
-                section, errors='coerce').astype(np.float64)
+            new_channel_values.values.double_array.values[:] = pd.to_numeric(section, errors="coerce").astype(
+                np.float64
+            )
         elif channel_datatype == ods.DataTypeEnum.DT_DATE:
             if isinstance(section.iloc[0], datetime.time):
                 values = [
-                    datetime.datetime.combine(datetime.date(1970, 1, 1), t).strftime('%Y%m%d%H%M%S%f')
-                    if pd.notnull(t) else ""
+                    (
+                        datetime.datetime.combine(datetime.date(1970, 1, 1), t).strftime("%Y%m%d%H%M%S%f")
+                        if pd.notnull(t)
+                        else ""
+                    )
                     for t in section
                 ]
                 new_channel_values.values.string_array.values[:] = values
             else:
-                new_channel_values.values.string_array.values[:] = section.dt.strftime(
-                    '%Y%m%d%H%M%S%f')
+                new_channel_values.values.string_array.values[:] = section.dt.strftime("%Y%m%d%H%M%S%f")
         elif channel_datatype == ods.DataTypeEnum.DT_COMPLEX:
             real_values = []
             for complex_value in section:
@@ -167,19 +231,19 @@ class ExternalDataReader(ods_external_data_pb2_grpc.ExternalDataReader):
                 real_values.append(complex_value.imag)
             new_channel_values.values.double_array.values[:] = real_values
         elif channel_datatype == ods.DataTypeEnum.DT_STRING:
-            new_channel_values.values.string_array.values[:] = section.fillna(
-                "").astype(dtype="str")
+            new_channel_values.values.string_array.values[:] = section.fillna("").astype(dtype="str")
         elif channel_datatype == ods.DataTypeEnum.DT_BYTESTR:
             for item in section:
-                new_channel_values.values.bytestr_array.values.append(
-                    item.tobytes())
+                new_channel_values.values.bytestr_array.values.append(item.tobytes())
         else:
             raise NotImplementedError(
                 f"Unknown np datatype {
                     section.dtype} for type {channel_datatype}!"
             )
 
-    def GetStructure(self, structure_request: exd_api.StructureRequest, context: grpc.ServicerContext) -> exd_api.StructureResult:
+    def GetStructure(
+        self, structure_request: exd_api.StructureRequest, context: grpc.ServicerContext
+    ) -> exd_api.StructureResult:
         """
         Get the structure of the file returned as file-group-channel hierarchy.
 
@@ -188,6 +252,8 @@ class ExternalDataReader(ods_external_data_pb2_grpc.ExternalDataReader):
         :raises NotImplementedError: If advanced features are requested.
         :return exd_api.StructureResult: The structure of the opened file.
         """
+        logging.info("GetStructure: Called")
+
         if (
             structure_request.suppress_channels
             or structure_request.suppress_attributes
@@ -198,21 +264,22 @@ class ExternalDataReader(ods_external_data_pb2_grpc.ExternalDataReader):
             raise NotImplementedError("Method not implemented!")
 
         identifier = self.connection_map[structure_request.handle.uuid]
-        xlsx = self.__get_by_handle(structure_request.handle)
+        logging.info("GetStructure: open file")
+        file_cache = self.__get_by_handle(structure_request.handle)
 
+        logging.info("GetStructure: fill result")
         rv = exd_api.StructureResult(identifier=identifier)
         rv.name = Path(identifier.url).name
         # rv.attributes.variables["start_time"].string_array.values.append(
-        #     xlsx.start_time.strftime("%Y%m%d%H%M%S%f"))
+        #     file_cache.xlsx().start_time.strftime("%Y%m%d%H%M%S%f"))
 
-        for sheet_index, sheet_name in enumerate(xlsx.sheet_names, start=0):
+        for sheet_index, sheet_name in enumerate(file_cache.xlsx().sheet_names, start=0):
 
-            meta_df, data_df = self.__load_sheet(context, xlsx, sheet_index)
+            meta_df, data_df = file_cache.load_sheet(context, sheet_index)
 
             column_descriptions = None
             column_units = None
-            mean_of_string_length = self.__calculate_mean_of_string_lengths(
-                meta_df)
+            mean_of_string_length = self.__calculate_mean_of_string_lengths(meta_df)
             if len(mean_of_string_length) > 0:
                 for index, row in meta_df.iterrows():
                     if mean_of_string_length[index] is not None:
@@ -232,44 +299,22 @@ class ExternalDataReader(ods_external_data_pb2_grpc.ExternalDataReader):
                 new_channel.name = column
                 new_channel.id = column_index
                 column_unit = column_units.iloc[column_index] if column_units is not None else None
-                column_description = column_descriptions.iloc[
-                    column_index] if column_descriptions is not None else None
+                column_description = (
+                    column_descriptions.iloc[column_index] if column_descriptions is not None else None
+                )
 
-                new_channel.data_type = self.__get_channel_data_type(
-                    data_df[column])
+                new_channel.data_type = self.__get_channel_data_type(data_df[column])
                 if column_unit is not None and not pd.isna(column_unit):
                     new_channel.unit_string = column_unit
                 if column_description is not None and not pd.isna(column_description):
-                    new_channel.attributes.variables["description"].string_array.values.append(
-                        column_description)
+                    new_channel.attributes.variables["description"].string_array.values.append(column_description)
                 if 0 == column_index and data_df.iloc[:, column_index].is_monotonic_increasing:
-                    new_channel.attributes.variables["independent"].long_array.values.append(
-                        1)
+                    new_channel.attributes.variables["independent"].long_array.values.append(1)
                 new_group.channels.append(new_channel)
 
             rv.groups.append(new_group)
 
         return rv
-
-    def __load_sheet(self, context, xlsx: pd.ExcelFile, sheet_index: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        sheet_df = pd.read_excel(xlsx, sheet_name=sheet_index)
-        first_stable_row = self.__find_stable_datatype_row(sheet_df)
-        if first_stable_row is None:
-            context.set_details(
-                f"No stable row found in sheet {xlsx.sheet_names[sheet_index]}!")
-            context.abort_with_status(status=grpc.StatusCode.OUT_OF_RANGE)
-
-        meta_df = pd.DataFrame(
-            columns=sheet_df.columns) if first_stable_row == 0 else sheet_df.iloc[:first_stable_row].copy()
-
-        data_df = None
-        if 0 == first_stable_row:
-            data_df = sheet_df
-        else:
-            data_df = sheet_df.drop(range(first_stable_row))
-            data_df.reset_index(drop=True, inplace=True)
-            data_df = data_df.infer_objects()
-        return meta_df, data_df
 
     def GetValues(self, values_request: exd_api.ValuesRequest, context: grpc.ServicerContext) -> exd_api.ValuesResult:
         """
@@ -280,41 +325,46 @@ class ExternalDataReader(ods_external_data_pb2_grpc.ExternalDataReader):
         :raises NotImplementedError: If unknown data type is accessed.
         :return exd_api.ValuesResult: The chunk of bulk data.
         """
-        xlsx = self.__get_by_handle(values_request.handle)
+        logging.info("GetValues: Called")
+        file_cache = self.__get_by_handle(values_request.handle)
+        logging.info("GetValues: Cache retrieved")
 
-        if values_request.group_id < 0 or values_request.group_id >= len(xlsx.sheet_names):
+        if values_request.group_id < 0 or values_request.group_id >= len(file_cache.xlsx().sheet_names):
             context.set_details(f"Invalid group id {values_request.group_id}!")
             context.abort_with_status(status=grpc.StatusCode.OUT_OF_RANGE)
 
-        _, bulk_df = self.__load_sheet(
-            context, xlsx, values_request.group_id)
+        logging.info("GetValues: Load sheet %s", values_request.group_id)
+        _, bulk_df = file_cache.load_sheet(context, values_request.group_id)
 
         nr_of_rows = bulk_df.shape[0]
         if values_request.start > nr_of_rows:
             context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-            context.set_details(f"Channel start index {
-                                values_request.start} out of range!")
-            raise NotImplementedError(f"Channel start index {
-                                      values_request.start} out of range!")
+            context.set_details(
+                f"Channel start index {
+                                values_request.start} out of range!"
+            )
+            raise NotImplementedError(
+                f"Channel start index {
+                                      values_request.start} out of range!"
+            )
 
-        end_index = min(values_request.start +
-                        values_request.limit, nr_of_rows)
+        end_index = min(values_request.start + values_request.limit, nr_of_rows)
 
+        logging.info("GetValues: Prepare return data %s", values_request.group_id)
         rv = exd_api.ValuesResult(id=values_request.group_id)
         for channel_id in values_request.channel_ids:
             if channel_id >= bulk_df.shape[1]:
                 context.set_details(f"Invalid channel id {channel_id}!")
                 context.abort_with_status(status=grpc.StatusCode.OUT_OF_RANGE)
 
-            section = bulk_df.iloc[values_request.start: end_index, channel_id]
+            section = bulk_df.iloc[values_request.start : end_index, channel_id]  # noqa: E203
 
             channel_datatype = self.__get_channel_data_type(section)
 
             new_channel_values = exd_api.ValuesResult.ChannelValues()
             new_channel_values.id = channel_id
 
-            self.__assign_df_values_to_unknown_sequence(
-                section, channel_datatype, new_channel_values)
+            self.__assign_df_values_to_unknown_sequence(section, channel_datatype, new_channel_values)
 
             rv.channels.append(new_channel_values)
 
@@ -360,14 +410,11 @@ class ExternalDataReader(ods_external_data_pb2_grpc.ExternalDataReader):
             connection_id = self.__get_id(identifier)
             connection_url = self.__get_path(identifier.url)
             if connection_url not in self.file_map:
-                self.file_map[connection_url] = {
-                    "xlsx": pd.ExcelFile(connection_url),
-                    "ref_count": 0
-                }
+                self.file_map[connection_url] = {"xlsx": FileCache(connection_url), "ref_count": 0}
             self.file_map[connection_url]["ref_count"] = self.file_map[connection_url]["ref_count"] + 1
             return connection_id
 
-    def __get_by_handle(self, handle: exd_api.Handle) -> pd.ExcelFile:
+    def __get_by_handle(self, handle: exd_api.Handle) -> FileCache:
         identifier = self.connection_map[handle.uuid]
         connection_url = self.__get_path(identifier.url)
         return self.file_map[connection_url]["xlsx"]
@@ -385,6 +432,12 @@ class ExternalDataReader(ods_external_data_pb2_grpc.ExternalDataReader):
 
 if __name__ == "__main__":
 
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
     from google.protobuf.json_format import MessageToJson
 
     external_data_reader = ExternalDataReader()
@@ -392,31 +445,49 @@ if __name__ == "__main__":
     exd_api_handle = external_data_reader.Open(
         exd_api.Identifier(
             # url="file:///workspaces/asam_ods_exd_api_xlsx/data/example_data_with_unit_and_comment.xlsx"), None
-            url="file:///workspaces/asam_ods_exd_api_xlsx/data/datetime_date.xlsx"), None
+            url="file:///workspaces/asam_ods_exd_api_xlsx/data/datetime_date.xlsx"
+        ),
+        None,
     )
     exd_api_request = exd_api.StructureRequest(handle=exd_api_handle)
-    exd_api_structure = external_data_reader.GetStructure(
-        exd_api_request, None)
-    print(MessageToJson(exd_api_structure))
+    logging.info("*** GetStructure: Retrieve structure")
+    exd_api_structure = external_data_reader.GetStructure(exd_api_request, None)
+    logging.info("*** GetStructure: Retrieved")
+    # print(MessageToJson(exd_api_structure))
 
     # loop over all channels and read values
     for group in exd_api_structure.groups:
         channel_ids = [channel.id for channel in group.channels]
         if len(channel_ids) > 0:
+            logging.info("*** GetValues: Read values of all channels from group %s", group.name)
             exd_api_values = external_data_reader.GetValues(
                 exd_api.ValuesRequest(
                     handle=exd_api_handle,
                     group_id=group.id,
                     channel_ids=channel_ids,
                     start=0,
-                    limit=group.number_of_rows), None)
+                    limit=group.number_of_rows,
+                ),
+                None,
+            )
+        logging.info("*** GetValues: Read values channel by channel from group %s", group.name)
+        for channel in group.channels:
+            exd_api_values = external_data_reader.GetValues(
+                exd_api.ValuesRequest(
+                    handle=exd_api_handle,
+                    group_id=group.id,
+                    channel_ids=[channel.id],
+                    start=0,
+                    limit=group.number_of_rows,
+                ),
+                None,
+            )
 
+    logging.info("*** GetValues: Some output")
     print(
         MessageToJson(
             external_data_reader.GetValues(
-                exd_api.ValuesRequest(
-                    handle=exd_api_handle, group_id=0, channel_ids=[0, 1], start=0, limit=100
-                ),
+                exd_api.ValuesRequest(handle=exd_api_handle, group_id=0, channel_ids=[0, 1], start=0, limit=100),
                 None,
             )
         )

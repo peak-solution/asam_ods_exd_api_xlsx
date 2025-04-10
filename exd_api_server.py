@@ -5,12 +5,12 @@ This is the script starting the GRPC server.
 # Prepare python to use GRPC interface:
 # python -m grpc_tools.protoc --proto_path=proto_src --pyi_out=. --python_out=. --grpc_python_out=. ods.proto ods_external_data.proto
 
-from concurrent import futures
 import logging
+from concurrent import futures
 
 import grpc
-import ods_external_data_pb2_grpc
 
+import ods_external_data_pb2_grpc
 from external_data_reader import ExternalDataReader
 
 
@@ -20,6 +20,7 @@ def serve():
     The server is started at 50051 using http only.
     By default the server will use https.
     """
+    logging.info("Starting server")
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     ods_external_data_pb2_grpc.add_ExternalDataReaderServicer_to_server(ExternalDataReader(), server)
     server.add_insecure_port("[::]:50051")
@@ -28,5 +29,9 @@ def serve():
 
 
 if __name__ == "__main__":
-    logging.basicConfig()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     serve()
