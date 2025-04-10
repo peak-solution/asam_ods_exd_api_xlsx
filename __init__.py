@@ -5,4 +5,4 @@ This module initializes the package with essential metadata. The version attribu
 helps in tracking the current release of the package.
 """
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
